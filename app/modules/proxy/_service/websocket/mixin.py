@@ -871,25 +871,49 @@ class _WebSocketMixin:
             account = None
             upstream_requires_security_work_authorized = None
 
+        async def settle_current_upstream_reader_if_ready() -> bool:
+            nonlocal account, replay_request_state, upstream, upstream_control, upstream_reader
+            if upstream_reader is None:
+                return False
+            if not upstream_reader.done():
+                should_wait_for_reader = False
+                wait_timeout_seconds: float | None = None
+                if upstream_control is not None and upstream_control.reconnect_requested:
+                    if upstream_control.replay_request_state is not None:
+                        should_wait_for_reader = True
+                    else:
+                        async with pending_lock:
+                            should_wait_for_reader = not pending_requests
+                        wait_timeout_seconds = None if should_wait_for_reader else 0.05
+                        should_wait_for_reader = True
+                if not should_wait_for_reader:
+                    return False
+                if wait_timeout_seconds is not None:
+                    await asyncio.wait({upstream_reader}, timeout=wait_timeout_seconds)
+                    if not upstream_reader.done():
+                        return False
+            try:
+                await asyncio.shield(upstream_reader)
+            except asyncio.CancelledError:
+                if not upstream_reader.cancelled():
+                    raise
+            if replay_request_state is None and upstream_control is not None:
+                replay_request_state = upstream_control.replay_request_state
+            upstream_reader = None
+            upstream_control = None
+            if upstream is not None:
+                try:
+                    await upstream.close()
+                except Exception:
+                    _facade().logger.debug("Failed to close upstream websocket", exc_info=True)
+            upstream = None
+            await release_current_account_lease()
+            account = None
+            return True
+
         try:
             while True:
-                if upstream_reader is not None and upstream_reader.done():
-                    try:
-                        await upstream_reader
-                    except asyncio.CancelledError:
-                        pass
-                    if replay_request_state is None and upstream_control is not None:
-                        replay_request_state = upstream_control.replay_request_state
-                    upstream_reader = None
-                    upstream_control = None
-                    if upstream is not None:
-                        try:
-                            await upstream.close()
-                        except Exception:
-                            _facade().logger.debug("Failed to close upstream websocket", exc_info=True)
-                    upstream = None
-                    await release_current_account_lease()
-                    account = None
+                await settle_current_upstream_reader_if_ready()
 
                 text_data: str | None = None
                 bytes_data: bytes | None = None
@@ -1003,27 +1027,16 @@ class _WebSocketMixin:
                     assert message is not None
                     if upstream_reader is not None:
                         await asyncio.sleep(0)
-
-                    if upstream_reader is not None and (
-                        upstream_reader.done()
-                        or (upstream_control is not None and upstream_control.reconnect_requested)
-                    ):
-                        try:
-                            await upstream_reader
-                        except asyncio.CancelledError:
-                            pass
-                        if replay_request_state is None and upstream_control is not None:
-                            replay_request_state = upstream_control.replay_request_state
-                        upstream_reader = None
-                        upstream_control = None
-                        if upstream is not None:
-                            try:
-                                await upstream.close()
-                            except Exception:
-                                _facade().logger.debug("Failed to close upstream websocket", exc_info=True)
-                        upstream = None
-                        await release_current_account_lease()
-                        account = None
+                    if upstream_reader is not None and not upstream_reader.done():
+                        async with pending_lock:
+                            wait_for_created_only_replay = any(
+                                _websocket_request_can_replay_before_visible_output(pending)
+                                for pending in pending_requests
+                            )
+                        if wait_for_created_only_replay or message["type"] != "websocket.receive":
+                            await asyncio.wait({upstream_reader}, timeout=0.05)
+                    settled_upstream_reader = await settle_current_upstream_reader_if_ready()
+                    if settled_upstream_reader:
                         if replay_request_state is not None and message["type"] == "websocket.receive":
                             deferred_downstream_message = message
                             continue
@@ -1189,23 +1202,7 @@ class _WebSocketMixin:
                                     )
                                 continue
 
-                if upstream_reader is not None and upstream_reader.done():
-                    try:
-                        await upstream_reader
-                    except asyncio.CancelledError:
-                        pass
-                    if replay_request_state is None and upstream_control is not None:
-                        replay_request_state = upstream_control.replay_request_state
-                    upstream_reader = None
-                    upstream_control = None
-                    if upstream is not None:
-                        try:
-                            await upstream.close()
-                        except Exception:
-                            _facade().logger.debug("Failed to close upstream websocket", exc_info=True)
-                    upstream = None
-                    await release_current_account_lease()
-                    account = None
+                await settle_current_upstream_reader_if_ready()
 
                 if replay_request_state is not None and received_downstream_message_for_defer is not None:
                     if request_state is not None and not request_state_registered:
@@ -1213,25 +1210,12 @@ class _WebSocketMixin:
                     deferred_downstream_message = received_downstream_message_for_defer
                     continue
 
-                if (
-                    request_state is not None
-                    and upstream_control is not None
-                    and upstream_control.reconnect_requested
-                    and upstream_reader is not None
-                ):
-                    await upstream_reader
-                    if replay_request_state is None:
-                        replay_request_state = upstream_control.replay_request_state
-                    upstream_reader = None
-                    upstream_control = None
-                    if upstream is not None:
-                        try:
-                            await upstream.close()
-                        except Exception:
-                            _facade().logger.debug("Failed to close upstream websocket", exc_info=True)
-                    upstream = None
-                    await release_current_account_lease()
-                    account = None
+                if request_state is not None and await settle_current_upstream_reader_if_ready():
+                    if replay_request_state is not None and received_downstream_message_for_defer is not None:
+                        if not request_state_registered:
+                            await proxy._release_websocket_request_state_reservation(request_state)
+                        deferred_downstream_message = received_downstream_message_for_defer
+                        continue
 
                 if request_state is not None and (
                     request_state.previous_response_id is not None
@@ -1490,23 +1474,7 @@ class _WebSocketMixin:
                                 await proxy._release_websocket_request_state_reservation(request_state)
                                 await _release_websocket_response_create_gate(request_state, response_create_gate)
                                 raise
-                    if upstream_reader is not None and upstream_reader.done():
-                        try:
-                            await upstream_reader
-                        except asyncio.CancelledError:
-                            pass
-                        if replay_request_state is None and upstream_control is not None:
-                            replay_request_state = upstream_control.replay_request_state
-                        upstream_reader = None
-                        upstream_control = None
-                        if upstream is not None:
-                            try:
-                                await upstream.close()
-                            except Exception:
-                                _facade().logger.debug("Failed to close upstream websocket", exc_info=True)
-                        upstream = None
-                        await release_current_account_lease()
-                        account = None
+                    if await settle_current_upstream_reader_if_ready():
                         if replay_request_state is not None and received_downstream_message_for_defer is not None:
                             await proxy._release_websocket_request_state_reservation(request_state)
                             deferred_downstream_message = received_downstream_message_for_defer

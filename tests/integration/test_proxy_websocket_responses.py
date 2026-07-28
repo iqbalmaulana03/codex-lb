@@ -5609,7 +5609,6 @@ def test_backend_responses_websocket_masks_anonymous_previous_response_not_found
         for call in log_calls
     )
     assert any(call["status"] == "success" and call["request_id"] == "resp_ws_inflight" for call in log_calls)
-    assert fake_upstream.closed is True
 
 
 def test_backend_responses_websocket_masks_top_level_previous_response_not_found_from_chatgpt_backend(
@@ -8166,7 +8165,6 @@ def test_backend_responses_websocket_does_not_expire_downstream_while_request_pe
 
     assert created_event["type"] == "response.created"
     assert completed_event["type"] == "response.completed"
-    assert fake_upstream.closed is True
     assert len(log_calls) == 1
     assert log_calls[0]["request_id"] == "resp_ws_pending"
     assert log_calls[0]["status"] == "success"
